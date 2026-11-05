@@ -1,0 +1,38 @@
+{
+  "name": "antigravity-quality-orchestration",
+  "version": "1.0.0",
+  "agents": [
+    "code-reviewer.md",
+    "design-challenger.md",
+    "implementer.md",
+    "qa-engineer.md",
+    "qa-test-designer.md",
+    "security-reviewer.md",
+    "system-architect.md",
+    "tech-lead.md",
+    "verification-auditor.md"
+  ],
+  "skills": [
+    "architecture-design",
+    "design-challenge",
+    "implementation",
+    "implementation-planning",
+    "independent-code-review",
+    "qa-execution",
+    "qa-test-design",
+    "remediation-triage",
+    "security-review",
+    "task-intake",
+    "verification-audit"
+  ],
+  "templates": [
+    "TEMPLATES/acceptance.md",
+    "TEMPLATES/design.md",
+    "TEMPLATES/findings.md",
+    "TEMPLATES/task-brief.md",
+    "TEMPLATES/task-plan.md",
+    "TEMPLATES/test-matrix.md",
+    "TEMPLATES/verification.md"
+  ],
+  "total_files": 32
+}
