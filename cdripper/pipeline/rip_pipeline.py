@@ -18,18 +18,23 @@ from cdripper.hardware.interface import ICDDrive
 from cdripper.metadata.itunes_client import ITunesApiClient
 from cdripper.pipeline.ffmpeg_encoder import FFmpegEncoder, sanitize_filename
 
+DEFAULT_BATCH_SECTORS = 25  # 1/3秒分 (58,800 bytes)
+
 
 def read_track_sectors(
     drive: ICDDrive,
     track: TrackTOC,
     on_chunk: Callable[[bytes], None],
     cancel_token: Optional[threading.Event] = None,
-    batch_size: int = 75,
+    batch_size: int = DEFAULT_BATCH_SECTORS,
 ) -> None:
     """
     Read raw CD-DA audio sectors for a single track with strict boundary control.
     Uses batch = min(batch_size, remaining) to never exceed track bounds (FINDING-006, TC-RIP-03).
     """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be a positive integer, got {batch_size}")
+
     remaining = track.sector_count
     current_lba = track.start_lba
 

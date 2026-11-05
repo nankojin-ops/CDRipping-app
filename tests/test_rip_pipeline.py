@@ -54,6 +54,51 @@ class TestRipPipeline(unittest.TestCase):
         read_track_sectors(drive, track, on_chunk, cancel_token=token, batch_size=75)
         self.assertEqual(len(chunks), 1)
 
+    def test_read_track_sectors_default_batch_size_25(self):
+        """TASK-006: batch_size省略時にデフォルト25セクタ単位でコールバックが呼ばれること"""
+        track = TrackTOC(
+            track_number=1,
+            start_lba=0,
+            end_lba=75,
+            sector_count=75,
+            duration_seconds=1.0,
+            is_audio=True,
+        )
+        drive = VirtualCDDrive()
+        drive.open("V:")
+
+        chunks = []
+        def on_chunk(chunk: bytes):
+            chunks.append(chunk)
+
+        read_track_sectors(drive, track, on_chunk)  # batch_size omitted
+
+        # 75 sectors with default batch_size=25 -> 3 chunks of 25 sectors
+        self.assertEqual(len(chunks), 3)
+        for chunk in chunks:
+            self.assertEqual(len(chunk), 25 * 2352)
+
+
+
+    def test_read_track_sectors_invalid_batch_size(self):
+        """SEC-PIPE-001: batch_size <= 0 で ValueError が送出されること"""
+        track = TrackTOC(
+            track_number=1,
+            start_lba=0,
+            end_lba=75,
+            sector_count=75,
+            duration_seconds=1.0,
+            is_audio=True,
+        )
+        drive = VirtualCDDrive()
+        drive.open("V:")
+
+        with self.assertRaises(ValueError):
+            read_track_sectors(drive, track, lambda chunk: None, batch_size=0)
+
+        with self.assertRaises(ValueError):
+            read_track_sectors(drive, track, lambda chunk: None, batch_size=-5)
+
 
 if __name__ == "__main__":
     unittest.main()
