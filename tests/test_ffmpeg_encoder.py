@@ -1,7 +1,7 @@
-"""Unit tests for FFmpeg encoder, argument construction, and filename sanitization (TC-ENC-01 - TC-ENC-08)."""
+"""Unit tests for FFmpeg encoder (TC-ENC-01 - TC-ENC-08, FIND-012, FIND-013, FIND-014)."""
 import os
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from cdripper.domain.exceptions import FFmpegNotFoundError
 from cdripper.domain.models import EncodeFormat, RipConfig
@@ -52,6 +52,12 @@ class TestFFmpegEncoder(unittest.TestCase):
         umlaut_name = "Mötley Crüe - Kickstart My Heart"
         self.assertEqual(sanitize_filename(umlaut_name), umlaut_name)
 
+    def test_sanitize_filename_reserved_including_conin_conout(self):
+        """FIND-012 (SEC-006): CONIN$ および CONOUT$ のエスケープ"""
+        self.assertEqual(sanitize_filename("CONIN$"), "_CONIN$")
+        self.assertEqual(sanitize_filename("CONOUT$"), "_CONOUT$")
+        self.assertEqual(sanitize_filename("CON"), "_CON")
+
     def test_build_ffmpeg_args_without_cover(self):
         """TC-ENC-01: アートワークなしAAC引数"""
         args = build_ffmpeg_args(
@@ -70,7 +76,6 @@ class TestFFmpegEncoder(unittest.TestCase):
 
     def test_build_ffmpeg_args_alac_and_mp3(self):
         """TC-ENC-03: ALAC および MP3 エンコード引数の構築"""
-        # ALAC
         args_alac = build_ffmpeg_args(
             output_path="C:/music/01.m4a",
             format_type=EncodeFormat.ALAC,
@@ -80,7 +85,6 @@ class TestFFmpegEncoder(unittest.TestCase):
         self.assertIn("-c:a", args_alac)
         self.assertIn("alac", args_alac)
 
-        # MP3 320k
         args_mp3 = build_ffmpeg_args(
             output_path="C:/music/01.mp3",
             format_type=EncodeFormat.MP3_320K,
@@ -103,8 +107,8 @@ class TestFFmpegEncoder(unittest.TestCase):
         with self.assertRaises(FFmpegNotFoundError):
             encoder.start_encoding_session("C:/dummy/out.m4a", config, {"title": "Test"})
 
-    def test_encoder_session_cancel_and_cleanup(self):
-        """TC-RIP-04: キャンセル時の一時ファイル消去"""
+    def test_encoder_session_cancel_closes_stdin(self):
+        """FIND-013 (SEC-007) & TC-RIP-04: cancel_and_cleanup で stdin.close() と一時ファイル消去"""
         mock_proc = MagicMock()
         mock_proc.stderr.readline.return_value = b""
         session = EncoderSession(mock_proc, temp_cover_path="dummy_cover.jpg")
@@ -115,7 +119,22 @@ class TestFFmpegEncoder(unittest.TestCase):
 
         session.cancel_and_cleanup(dummy_out)
         mock_proc.terminate.assert_called_once()
+        mock_proc.stdin.close.assert_called()
         self.assertFalse(os.path.exists(dummy_out))
+
+    def test_artwork_extension_png_magic_byte(self):
+        """FIND-014 (REV-007): PNGマジックバイトを判定して .png 拡張子を適用すること"""
+        encoder = FFmpegEncoder()
+        encoder.is_ffmpeg_available = MagicMock(return_value=True)
+
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"dummy"
+        config = RipConfig(output_dir="dummy_out", format=EncodeFormat.AAC_256K)
+
+        with patch("subprocess.Popen") as mock_popen:
+            mock_popen.return_value = MagicMock()
+            session = encoder.start_encoding_session("dummy_out/track.m4a", config, {}, png_bytes)
+            self.assertTrue(session.temp_cover_path.endswith(".png"))
+            session._cleanup_cover()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Unit tests for DriveSpeedOptimizer (TC-SPD-01, TC-SPD-02, TC-SPD-03, TC-SPD-05)."""
+"""Unit tests for DriveSpeedOptimizer (TC-SPD-01, TC-SPD-02, TC-SPD-03, TC-SPD-05, FIND-007)."""
 import unittest
 
 from cdripper.domain.models import BusType, DriveInfo
@@ -20,6 +20,13 @@ class TestSpeedOptimizer(unittest.TestCase):
         info = DriveInfo("F:", "Unknown", BusType.UNKNOWN, True, 0, 0)
         rec = DriveSpeedOptimizer.calculate_recommended_speed(info)
         self.assertEqual(rec, 8)
+
+    def test_speed_capped_by_max_speed(self):
+        """FIND-007 (REV-005): 推奨倍速がmax_read_speed_xを決して超えないこと"""
+        # USBドライブでmax_read_speed_xが4の場合、DEFAULT 8xではなく4xにキャップされる
+        slow_usb = DriveInfo("G:", "Slow USB", BusType.USB, True, 4, 0)
+        rec = DriveSpeedOptimizer.calculate_recommended_speed(slow_usb)
+        self.assertEqual(rec, 4)
 
     def test_adaptive_speed_down(self):
         self.assertEqual(DriveSpeedOptimizer.adaptive_speed_down(24), 16)

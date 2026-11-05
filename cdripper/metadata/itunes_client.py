@@ -12,6 +12,8 @@ from cdripper.domain.exceptions import MetadataNetworkError, MetadataNotFoundErr
 from cdripper.domain.models import AlbumMetadata, DiscTOC, TrackMetadata, TrackTOC
 from cdripper.metadata.interface import IMetadataProvider
 
+MAX_ARTWORK_SIZE = 10 * 1024 * 1024  # 10 MB limit (FIND-009 / SEC-002)
+
 
 class ITunesApiClient(IMetadataProvider):
     """Client for querying Apple iTunes Search / Lookup APIs."""
@@ -101,25 +103,37 @@ class ITunesApiClient(IMetadataProvider):
         return album
 
     def download_artwork(self, artwork_url: str, size: int = 1200) -> Optional[bytes]:
-        """Download album artwork with high-resolution URL replacement."""
+        """
+        Download album artwork with high-resolution URL replacement.
+        Guarded with URL scheme validation (FIND-004) and size limit (FIND-009).
+        """
         if not artwork_url:
+            return None
+
+        # FIND-004 (SEC-001): Reject non-HTTP schemes (prevents SSRF / file://)
+        parsed = urllib.parse.urlparse(artwork_url)
+        if parsed.scheme.lower() not in ("http", "https"):
             return None
 
         highres_url = self.get_highres_artwork_url(artwork_url, size=size)
 
-        try:
-            req = urllib.request.Request(highres_url, headers={"User-Agent": "CDRippingApp/1.0"})
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return resp.read()
-        except Exception:
-            if highres_url != artwork_url:
-                try:
-                    req = urllib.request.Request(artwork_url, headers={"User-Agent": "CDRippingApp/1.0"})
-                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                        return resp.read()
-                except Exception:
-                    pass
-            return None
+        for target_url in [highres_url, artwork_url]:
+            try:
+                parsed_tgt = urllib.parse.urlparse(target_url)
+                if parsed_tgt.scheme.lower() not in ("http", "https"):
+                    continue
+
+                req = urllib.request.Request(target_url, headers={"User-Agent": "CDRippingApp/1.0"})
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    # FIND-009 (SEC-002): Read up to MAX_ARTWORK_SIZE + 1 bytes to detect oversized responses
+                    data = resp.read(MAX_ARTWORK_SIZE + 1)
+                    if len(data) > MAX_ARTWORK_SIZE:
+                        return None
+                    return data
+            except Exception:
+                continue
+
+        return None
 
     @staticmethod
     def get_highres_artwork_url(artwork_url: str, size: int = 1200) -> str:
@@ -137,17 +151,22 @@ class ITunesApiClient(IMetadataProvider):
 
     @staticmethod
     def match_tracks_with_toc(
-        toc: DiscTOC,
+        toc: Optional[DiscTOC],
         album: AlbumMetadata,
         disc_number: int = 1,
         tolerance_seconds: float = 4.0,
-    ) -> Tuple[List[Tuple[TrackTOC, Optional[TrackMetadata]]], bool]:
+    ) -> Tuple[List[Tuple[Optional[TrackTOC], Optional[TrackMetadata]]], bool]:
         """
         Match CD TOC tracks with iTunes tracks for the given disc.
-        Returns (matched_list, is_complete_match).
+        FIND-002: Safely handles toc is None without raising AttributeError.
         """
         disc_tracks = ITunesApiClient.filter_tracks_by_disc(album, disc_number)
-        matched: List[Tuple[TrackTOC, Optional[TrackMetadata]]] = []
+
+        # FIND-002 (REV-002): Guard against None TOC
+        if toc is None or not toc.tracks:
+            return [(None, t) for t in disc_tracks], False
+
+        matched: List[Tuple[Optional[TrackTOC], Optional[TrackMetadata]]] = []
         is_complete = True
 
         if len(toc.tracks) != len(disc_tracks):

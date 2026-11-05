@@ -23,6 +23,7 @@ class DriveSpeedOptimizer:
         - USB external drive: Conservative 8x (or max/3) to prevent buffer underrun and mechanical vibration.
         - SATA/ATAPI internal drive: 16x (or max/3) for stability and low acoustic noise.
         - Fallback: If max speed unknown or <= 0, returns default safe speed.
+        - FIND-007: Capped so it never exceeds max_read_speed_x when max_read_speed_x > 0.
         """
         bus = drive_info.bus_type
         max_speed = drive_info.max_read_speed_x
@@ -34,12 +35,20 @@ class DriveSpeedOptimizer:
 
         if bus == BusType.USB:
             speed = min(calculated, 12)
-            return max(cls.DEFAULT_USB_SAFE_SPEED, min(speed, cls.MAX_SPEED_X))
+            rec = max(cls.DEFAULT_USB_SAFE_SPEED, min(speed, cls.MAX_SPEED_X))
         elif bus in (BusType.SATA, BusType.ATAPI):
             speed = min(calculated, 24)
-            return max(cls.DEFAULT_SATA_SAFE_SPEED, min(speed, cls.MAX_SPEED_X))
+            rec = max(cls.DEFAULT_SATA_SAFE_SPEED, min(speed, cls.MAX_SPEED_X))
+        elif bus == BusType.VIRTUAL:
+            rec = 8
         else:
-            return max(cls.DEFAULT_UNKNOWN_SAFE_SPEED, min(calculated, 16))
+            rec = max(cls.DEFAULT_UNKNOWN_SAFE_SPEED, min(calculated, 16))
+
+        # FIND-007 (REV-005): Never exceed physical maximum speed of the drive
+        if max_speed > 0:
+            rec = min(rec, max_speed)
+
+        return rec
 
     @classmethod
     def get_safe_fallback_speed(cls, bus_type: Optional[BusType]) -> int:

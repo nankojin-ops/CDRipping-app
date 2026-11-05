@@ -1,4 +1,4 @@
-"""Unit tests for iTunes API client and metadata parsing (TC-MET-01 - TC-MET-08)."""
+"""Unit tests for iTunes API client (TC-MET-01 - TC-MET-08, FIND-002, FIND-004, FIND-009)."""
 import unittest
 import urllib.error
 from unittest.mock import MagicMock, patch
@@ -47,6 +47,26 @@ class TestITunesClient(unittest.TestCase):
         self.assertEqual(len(disc2_tracks), 1)
         self.assertEqual(disc2_tracks[0].track_title, "D2 Track 1")
 
+    def test_match_tracks_with_none_toc(self):
+        """FIND-002 (REV-002): toc is None の場合にクラッシュせずリストを返却すること"""
+        album = AlbumMetadata(
+            collection_id=1,
+            album_name="Test Album",
+            artist_name="Test Artist",
+            release_year="2026",
+            genre="Rock",
+            total_tracks=2,
+            tracks=[
+                TrackMetadata(1, "Track 1", "Test Artist", 3000, 1),
+                TrackMetadata(2, "Track 2", "Test Artist", 4000, 1),
+            ],
+        )
+        matched, is_complete = ITunesApiClient.match_tracks_with_toc(None, album, 1)
+        self.assertFalse(is_complete)
+        self.assertEqual(len(matched), 2)
+        self.assertIsNone(matched[0][0])
+        self.assertEqual(matched[0][1].track_title, "Track 1")
+
     def test_match_tracks_with_toc_normal(self):
         """正常系のTOCマッチング"""
         toc = DiscTOC(
@@ -78,7 +98,6 @@ class TestITunesClient(unittest.TestCase):
 
     def test_match_tracks_with_toc_mismatch(self):
         """TC-MET-04 (境界値): トラック数不一致および演奏時間4秒超の差分で is_complete == False"""
-        # トラック数不一致 (CD: 2曲 vs iTunes: 3曲)
         toc = DiscTOC(
             first_track=1,
             last_track=2,
@@ -105,7 +124,6 @@ class TestITunesClient(unittest.TestCase):
         matched, is_complete = ITunesApiClient.match_tracks_with_toc(toc, album_3tracks, 1)
         self.assertFalse(is_complete)
 
-        # 演奏時間の差が4秒を超える場合 (CD: 3.0s vs iTunes: 10.0s)
         album_diff_duration = AlbumMetadata(
             collection_id=1,
             album_name="Test",
@@ -114,7 +132,7 @@ class TestITunesClient(unittest.TestCase):
             genre="Rock",
             total_tracks=2,
             tracks=[
-                TrackMetadata(1, "Track 1", "Test Artist", 10000, 1),  # 10s vs 3s
+                TrackMetadata(1, "Track 1", "Test Artist", 10000, 1),
                 TrackMetadata(2, "Track 2", "Test Artist", 4000, 1),
             ],
         )
@@ -125,11 +143,9 @@ class TestITunesClient(unittest.TestCase):
 
     def test_search_zero_results(self):
         """TC-MET-05: 検索結果0件ハンドリング"""
-        # 空文字列検索
         empty_res = self.client.search_albums("")
         self.assertEqual(empty_res, [])
 
-        # APIが結果0件を返した場合
         with patch("urllib.request.urlopen") as mock_url:
             mock_resp = MagicMock()
             mock_resp.read.return_value = b'{"resultCount": 0, "results": []}'
@@ -145,7 +161,6 @@ class TestITunesClient(unittest.TestCase):
             "collectionId": 9999,
             "collectionName": "Sparse Album",
             "artistName": "Sparse Artist",
-            # releaseDate, primaryGenreName, artworkUrl100 missing or None
         }
         album = self.client._parse_album_item(raw_item)
         self.assertEqual(album.collection_id, 9999)
@@ -154,8 +169,24 @@ class TestITunesClient(unittest.TestCase):
         self.assertEqual(album.genre, "Unknown Genre")
         self.assertIsNone(album.artwork_url)
 
+    def test_download_artwork_scheme_validation(self):
+        """FIND-004 (SEC-001): http/https 以外のスキーム（file:// 等）は拒否すること"""
+        self.assertIsNone(self.client.download_artwork("file:///etc/passwd"))
+        self.assertIsNone(self.client.download_artwork("ftp://example.com/art.jpg"))
+        self.assertIsNone(self.client.download_artwork("javascript:alert(1)"))
+
+    def test_download_artwork_size_limit(self):
+        """FIND-009 (SEC-002): 10MBを超えるアートワークは安全に破棄してNoneを返すこと"""
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = b"X" * (10 * 1024 * 1024 + 1)
+            mock_url.return_value.__enter__.return_value = mock_resp
+
+            result = self.client.download_artwork("https://example.com/huge.jpg")
+            self.assertIsNone(result)
+
     def test_network_error_handling(self):
-        """TC-MET-06 (異常系): 通信障害・タイムアウト時に MetadataNetworkError が送出されること"""
+        """TC-MET-06: ネットワークエラー時にMetadataNetworkErrorが送出されること"""
         with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Connection timed out")):
             with self.assertRaises(MetadataNetworkError):
                 self.client.search_albums("Abbey Road")

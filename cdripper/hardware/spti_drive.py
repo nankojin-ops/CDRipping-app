@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import sys
 from ctypes import wintypes
 from typing import List, Optional
@@ -23,12 +24,13 @@ GENERIC_WRITE = 0x40000000
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
 OPEN_EXISTING = 3
-INVALID_HANDLE_VALUE = -1
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 # IOCTL codes
 IOCTL_CDROM_READ_TOC = 0x00024000
 IOCTL_CDROM_RAW_READ = 0x0002403E
 IOCTL_SCSI_PASS_THROUGH_DIRECT = 0x0004D014
+IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400
 
 # Win32 Error codes
 ERROR_ACCESS_DENIED = 5
@@ -36,6 +38,56 @@ ERROR_NOT_READY = 21
 ERROR_NO_MEDIA_IN_DRIVE = 1112
 
 DRIVE_CDROM = 5
+
+# Storage Query Property IDs
+PropertyStandardQuery = 0
+StorageDeviceProperty = 0
+
+# Storage Bus Types
+STORAGE_BUS_TYPE_ATAPI = 2
+STORAGE_BUS_TYPE_ATA = 3
+STORAGE_BUS_TYPE_USB = 7
+STORAGE_BUS_TYPE_SATA = 11
+
+
+# Setup 64-bit safe Win32 API signatures (FIND-005 / SEC-003)
+if sys.platform == "win32":
+    k32 = ctypes.windll.kernel32
+
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+
+    k32.CloseHandle.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    k32.DeviceIoControl.restype = wintypes.BOOL
+    k32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+
+    k32.GetLastError.restype = wintypes.DWORD
+    k32.GetLastError.argtypes = []
+
+    k32.GetDriveTypeW.restype = wintypes.UINT
+    k32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+
+    k32.GetLogicalDrives.restype = wintypes.DWORD
+    k32.GetLogicalDrives.argtypes = []
 
 
 class TRACK_DATA(ctypes.Structure):
@@ -83,6 +135,32 @@ class SCSI_PASS_THROUGH_DIRECT(ctypes.Structure):
     ]
 
 
+class STORAGE_PROPERTY_QUERY(ctypes.Structure):
+    _fields_ = [
+        ("PropertyId", ctypes.c_int),
+        ("QueryType", ctypes.c_int),
+        ("AdditionalParameters", ctypes.c_ubyte * 1),
+    ]
+
+
+class STORAGE_DEVICE_DESCRIPTOR(ctypes.Structure):
+    _fields_ = [
+        ("Version", ctypes.c_ulong),
+        ("Size", ctypes.c_ulong),
+        ("DeviceType", ctypes.c_ubyte),
+        ("DeviceTypeModifier", ctypes.c_ubyte),
+        ("RemovableMedia", ctypes.c_ubyte),
+        ("CommandQueueing", ctypes.c_ubyte),
+        ("VendorIdOffset", ctypes.c_ulong),
+        ("ProductIdOffset", ctypes.c_ulong),
+        ("ProductRevisionOffset", ctypes.c_ulong),
+        ("SerialNumberOffset", ctypes.c_ulong),
+        ("BusType", ctypes.c_int),
+        ("RawPropertiesLength", ctypes.c_ulong),
+        ("RawDeviceProperties", ctypes.c_ubyte * 512),
+    ]
+
+
 class WindowsSPTICDDrive(ICDDrive):
     """Windows Optical Drive Reader using SPTI and Win32 IOCTLs."""
 
@@ -111,7 +189,7 @@ class WindowsSPTICDDrive(ICDDrive):
         return drives
 
     def _query_drive_info(self, letter: str) -> DriveInfo:
-        """Query drive details (display name, bus type, max speed)."""
+        """Query drive details (display name, bus type, max speed) via Win32 IOCTL (FIND-008)."""
         bus_type = BusType.UNKNOWN
         display_name = f"CD/DVD Drive ({letter})"
         max_speed = 0
@@ -120,6 +198,7 @@ class WindowsSPTICDDrive(ICDDrive):
         is_ready = False
         if handle and handle != INVALID_HANDLE_VALUE:
             try:
+                # Query TOC to check readiness
                 toc = CDROM_TOC()
                 bytes_returned = wintypes.DWORD()
                 ok = ctypes.windll.kernel32.DeviceIoControl(
@@ -134,12 +213,56 @@ class WindowsSPTICDDrive(ICDDrive):
                 )
                 if ok:
                     is_ready = True
+
+                # FIND-008 (REV-006): Query Storage Device Descriptor for bus type
+                query = STORAGE_PROPERTY_QUERY()
+                query.PropertyId = StorageDeviceProperty
+                query.QueryType = PropertyStandardQuery
+
+                desc = STORAGE_DEVICE_DESCRIPTOR()
+                desc_bytes = wintypes.DWORD()
+                query_ok = ctypes.windll.kernel32.DeviceIoControl(
+                    handle,
+                    IOCTL_STORAGE_QUERY_PROPERTY,
+                    ctypes.byref(query),
+                    ctypes.sizeof(query),
+                    ctypes.byref(desc),
+                    ctypes.sizeof(desc),
+                    ctypes.byref(desc_bytes),
+                    None,
+                )
+                if query_ok:
+                    raw_bus = desc.BusType
+                    if raw_bus == STORAGE_BUS_TYPE_USB:
+                        bus_type = BusType.USB
+                    elif raw_bus == STORAGE_BUS_TYPE_SATA:
+                        bus_type = BusType.SATA
+                    elif raw_bus in (STORAGE_BUS_TYPE_ATAPI, STORAGE_BUS_TYPE_ATA):
+                        bus_type = BusType.ATAPI
+
+                    # Extract product / vendor string if available
+                    raw_bytes = bytes(desc.RawDeviceProperties)
+                    prod_offset = desc.ProductIdOffset
+                    if prod_offset > 0 and prod_offset < len(raw_bytes):
+                        end = raw_bytes.find(b"\x00", prod_offset)
+                        if end != -1:
+                            prod_str = raw_bytes[prod_offset:end].decode("ascii", errors="ignore").strip()
+                            if prod_str:
+                                display_name = f"{prod_str} ({letter})"
             except Exception:
                 pass
             finally:
                 ctypes.windll.kernel32.CloseHandle(handle)
 
-        recommended = DriveSpeedOptimizer.get_safe_fallback_speed(bus_type)
+        temp_info = DriveInfo(
+            drive_letter=letter,
+            display_name=display_name,
+            bus_type=bus_type,
+            is_ready=is_ready,
+            max_read_speed_x=max_speed,
+            recommended_speed_x=0,
+        )
+        recommended = DriveSpeedOptimizer.calculate_recommended_speed(temp_info)
         return DriveInfo(
             drive_letter=letter,
             display_name=display_name,
@@ -150,7 +273,7 @@ class WindowsSPTICDDrive(ICDDrive):
         )
 
     def _open_handle(self, drive_letter: str, read_only: bool = False):
-        """Open Win32 file handle to \\\\.\\X:."""
+        """Open Win32 file handle to \\\\.\\X: with 64-bit safe types."""
         if sys.platform != "win32":
             return None
 
@@ -184,7 +307,11 @@ class WindowsSPTICDDrive(ICDDrive):
         return handle
 
     def open(self, drive_letter: str) -> bool:
-        """Open the target optical drive."""
+        """Open the target optical drive with input validation (FIND-010)."""
+        # FIND-010 (SEC-004): Validate drive letter format (e.g. "D:")
+        if not re.match(r"^[a-zA-Z]:$", drive_letter):
+            raise ValueError(f"Invalid drive letter format: {drive_letter}")
+
         if sys.platform != "win32":
             raise CDDriveNotFoundError("SPTI drive is only supported on Windows.")
 
@@ -210,7 +337,7 @@ class WindowsSPTICDDrive(ICDDrive):
         self._drive_letter = None
 
     def read_toc(self) -> DiscTOC:
-        """Read CD-DA Table of Contents."""
+        """Read CD-DA Table of Contents with track bound validation (FIND-011)."""
         if not self._handle or self._handle == INVALID_HANDLE_VALUE:
             raise CDDriveNotFoundError("Drive is not open.")
 
@@ -234,6 +361,12 @@ class WindowsSPTICDDrive(ICDDrive):
             if err == ERROR_ACCESS_DENIED:
                 raise CDDriveAccessDeniedError("Access denied reading TOC.")
             raise CDDriveReadError(f"Failed to read TOC. Win32 error: {err}")
+
+        # FIND-011 (SEC-005): Validate TOC track boundaries (Red Book 1-99)
+        if not (1 <= toc.FirstTrack <= toc.LastTrack <= 99):
+            raise CDDriveReadError(
+                f"Invalid TOC track bounds: FirstTrack={toc.FirstTrack}, LastTrack={toc.LastTrack}"
+            )
 
         tracks: List[TrackTOC] = []
         track_count = toc.LastTrack - toc.FirstTrack + 1

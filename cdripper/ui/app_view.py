@@ -1,9 +1,11 @@
 """Tkinter Desktop UI implementation for CD Ripping Application."""
 from __future__ import annotations
 
+import base64
 import ctypes
 import os
 import sys
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import List, Optional
@@ -43,6 +45,8 @@ class CDRipperAppView:
         self.root.title("CD Ripping App - iTunes High Quality Ripping")
         self.root.geometry("900x700")
         self.root.minsize(800, 600)
+
+        self._artwork_photo: Optional[tk.PhotoImage] = None  # GC prevention (FIND-003)
 
         self._init_ui()
         self._start_queue_polling()
@@ -120,7 +124,7 @@ class CDRipperAppView:
         art_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
         self.art_canvas = tk.Canvas(art_frame, width=150, height=150, bg="#e0e0e0")
         self.art_canvas.pack(pady=5)
-        self.art_canvas.create_text(75, 75, text="No Artwork\n(1200x1200bb)", fill="#888888", justify=tk.CENTER)
+        self._draw_no_artwork()
 
         enc_frame = ttk.Frame(self.root, padding=10)
         enc_frame.pack(fill=tk.X, padx=10, pady=2)
@@ -174,13 +178,17 @@ class CDRipperAppView:
 
         self.presenter.scan_drives()
 
+    def _draw_no_artwork(self):
+        self.art_canvas.delete("all")
+        self.art_canvas.create_text(75, 75, text="No Artwork\n(1200x1200bb)", fill="#888888", justify=tk.CENTER)
+
     def _start_queue_polling(self):
         def poll():
             try:
                 while True:
                     event, payload = self.presenter.event_queue.get_nowait()
                     self._handle_presenter_event(event, payload)
-            except queue.Empty:
+            except Exception:
                 pass
             finally:
                 self.root.after(50, poll)
@@ -210,6 +218,18 @@ class CDRipperAppView:
             self.txt_artist.insert(0, album.artist_name)
             self._update_tracks_with_metadata(album)
 
+            # FIND-003 (REV-003): Display artwork preview safely
+            if album.artwork_data:
+                try:
+                    b64 = base64.b64encode(album.artwork_data).decode("ascii")
+                    self._artwork_photo = tk.PhotoImage(data=b64)
+                    self.art_canvas.delete("all")
+                    self.art_canvas.create_image(75, 75, image=self._artwork_photo)
+                except Exception:
+                    self._draw_no_artwork()
+            else:
+                self._draw_no_artwork()
+
         elif event == PresenterEvent.PROGRESS_UPDATE:
             prog: RipProgress = payload
             self.prog_track["value"] = prog.track_progress_percent
@@ -228,6 +248,9 @@ class CDRipperAppView:
             self._append_log(str(payload))
 
         elif event == PresenterEvent.ERROR:
+            # FIND-001 (REV-001): Restore button states on error
+            self.btn_start_rip.config(state=tk.NORMAL)
+            self.btn_cancel.config(state=tk.DISABLED)
             self._append_log(f"ERROR: {payload}")
             messagebox.showwarning("Notice", str(payload))
 
@@ -242,9 +265,18 @@ class CDRipperAppView:
         if matched:
             d = matched[0]
             rec = DriveSpeedOptimizer.calculate_recommended_speed(d)
-            self.lbl_speed_info.config(
-                text=f"Recommended: {rec}x ({'External USB' if d.bus_type == BusType.USB else 'SATA Internal'})"
-            )
+            # FIND-015 (REV-008): Format speed label based on BusType
+            if d.bus_type == BusType.USB:
+                bus_label = "External USB Safe"
+            elif d.bus_type == BusType.SATA:
+                bus_label = "SATA Internal"
+            elif d.bus_type == BusType.ATAPI:
+                bus_label = "ATAPI Internal"
+            elif d.bus_type == BusType.VIRTUAL:
+                bus_label = "Virtual CD Mode"
+            else:
+                bus_label = "Standard Safe"
+            self.lbl_speed_info.config(text=f"Recommended: {rec}x ({bus_label})")
 
     def _on_toggle_virtual(self):
         self.presenter.switch_to_virtual_drive()
@@ -264,25 +296,35 @@ class CDRipperAppView:
             )
 
     def _update_tracks_with_metadata(self, album: AlbumMetadata):
+        # FIND-002: Safely handles toc is None
         matched_tracks, is_complete = ITunesApiClient.match_tracks_with_toc(
             self.presenter.current_toc, album, self.presenter.selected_disc
         )
-        if not is_complete:
+        if self.presenter.current_toc and not is_complete:
             self._append_log("Warning: Track count or duration mismatch with CD TOC.")
 
         for item in self.tree.get_children():
             self.tree.delete(item)
 
         for toc_track, itunes_track in matched_tracks:
-            mins = int(toc_track.duration_seconds // 60)
-            secs = int(toc_track.duration_seconds % 60)
-            time_str = f"{mins:02d}:{secs:02d}"
-            title = itunes_track.track_title if itunes_track else f"Track {toc_track.track_number:02d}"
+            if toc_track:
+                mins = int(toc_track.duration_seconds // 60)
+                secs = int(toc_track.duration_seconds % 60)
+                time_str = f"{mins:02d}:{secs:02d}"
+                trk_num = toc_track.track_number
+            else:
+                duration_sec = (itunes_track.duration_millis / 1000.0) if itunes_track else 0.0
+                mins = int(duration_sec // 60)
+                secs = int(duration_sec % 60)
+                time_str = f"{mins:02d}:{secs:02d}"
+                trk_num = itunes_track.track_number if itunes_track else 1
+
+            title = itunes_track.track_title if itunes_track else f"Track {trk_num:02d}"
             artist = itunes_track.artist_name if itunes_track else album.artist_name
             self.tree.insert(
                 "",
                 tk.END,
-                values=(toc_track.track_number, title, artist, time_str, "Ready"),
+                values=(trk_num, title, artist, time_str, "Ready"),
             )
 
     def _open_search_dialog(self):
@@ -299,18 +341,35 @@ class CDRipperAppView:
         txt_q.insert(0, query)
         txt_q.pack(side=tk.LEFT, padx=5)
 
+        lbl_status = ttk.Label(dlg, text="", foreground="gray")
+        lbl_status.pack(anchor=tk.W, padx=10)
+
         lst = tk.Listbox(dlg)
         lst.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         albums_cache: List[AlbumMetadata] = []
 
+        # FIND-006 (REV-004): Asynchronous non-blocking iTunes search
         def do_search():
+            q_text = txt_q.get()
+            btn_search.config(state=tk.DISABLED)
+            lbl_status.config(text="Searching iTunes...")
             lst.delete(0, tk.END)
             albums_cache.clear()
-            results = self.presenter.metadata_provider.search_albums(txt_q.get())
-            for a in results:
-                albums_cache.append(a)
-                lst.insert(tk.END, f"{a.album_name} - {a.artist_name} ({a.release_year}, {a.total_tracks} tracks)")
+
+            def worker():
+                results = self.presenter.metadata_provider.search_albums(q_text)
+
+                def update_ui():
+                    btn_search.config(state=tk.NORMAL)
+                    lbl_status.config(text=f"Found {len(results)} album(s).")
+                    for a in results:
+                        albums_cache.append(a)
+                        lst.insert(tk.END, f"{a.album_name} - {a.artist_name} ({a.release_year}, {a.total_tracks} tracks)")
+
+                dlg.after(0, update_ui)
+
+            threading.Thread(target=worker, daemon=True).start()
 
         btn_search = ttk.Button(top, text="Search", command=do_search)
         btn_search.pack(side=tk.LEFT, padx=5)
@@ -330,6 +389,13 @@ class CDRipperAppView:
         do_search()
 
     def _on_start_rip(self):
+        # FIND-001 (REV-001): Guard against starting without a loaded TOC
+        if not self.presenter.current_toc:
+            messagebox.showwarning("Notice", "No CD loaded or TOC available to rip.")
+            self.btn_start_rip.config(state=tk.NORMAL)
+            self.btn_cancel.config(state=tk.DISABLED)
+            return
+
         out_dir = self.txt_outdir.get().strip()
         if not out_dir:
             messagebox.showerror("Error", "Please specify an output folder.")

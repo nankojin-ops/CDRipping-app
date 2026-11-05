@@ -14,10 +14,10 @@ from cdripper.domain.models import EncodeFormat, RipConfig
 
 
 def sanitize_filename(name: str, max_length: int = 120) -> str:
-    r"""
+    """
     Sanitize filename for Windows NTFS file systems.
-    - Replaces invalid characters: \ / : * ? " < > | with '_'
-    - Handles reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    - Replaces invalid characters: \\ / : * ? " < > | with '_'
+    - Handles reserved device names including CONIN$ and CONOUT$ (FIND-012)
     - Strips trailing dots and spaces
     - Limits string length to prevent MAX_PATH overflow
     """
@@ -26,7 +26,8 @@ def sanitize_filename(name: str, max_length: int = 120) -> str:
 
     sanitized = re.sub(r'[\\/*?:"<>|]', "_", name).strip()
 
-    reserved_pattern = r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$"
+    # FIND-012 (SEC-006): Add CONIN$ and CONOUT$ to reserved pattern
+    reserved_pattern = r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$)(\..*)?$"
     if re.match(reserved_pattern, sanitized, re.IGNORECASE):
         sanitized = f"_{sanitized}"
 
@@ -138,11 +139,6 @@ class EncoderSession:
             self.process.kill()
             raise EncodingError(f"FFmpeg process did not terminate cleanly: {e}")
         finally:
-            if self.process.stderr:
-                try:
-                    self.process.stderr.close()
-                except Exception:
-                    pass
             self._cleanup_cover()
 
         if self.process.returncode != 0:
@@ -152,7 +148,7 @@ class EncoderSession:
             )
 
     def cancel_and_cleanup(self, output_path: str) -> None:
-        """Terminate process and purge incomplete output and temp cover files."""
+        """Terminate process and purge incomplete output and temp cover files (FIND-013)."""
         self._is_closed = True
         try:
             self.process.terminate()
@@ -163,11 +159,13 @@ class EncoderSession:
             except Exception:
                 pass
         finally:
-            if self.process.stderr:
+            # FIND-013 (SEC-007): Ensure stdin is closed on cancellation
+            if self.process.stdin:
                 try:
-                    self.process.stderr.close()
-                except Exception:
+                    self.process.stdin.close()
+                except OSError:
                     pass
+
             self._cleanup_cover()
             if os.path.exists(output_path):
                 try:
@@ -223,7 +221,9 @@ class FFmpegEncoder:
 
         temp_cover_path = None
         if artwork_bytes:
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+            # FIND-014 (REV-007): Detect PNG magic bytes or default to JPEG
+            ext = ".png" if artwork_bytes.startswith(b"\x89PNG") else ".jpg"
+            with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
                 tf.write(artwork_bytes)
                 temp_cover_path = tf.name
 
