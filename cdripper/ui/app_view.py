@@ -358,14 +358,22 @@ class CDRipperAppView:
             albums_cache.clear()
 
             def worker():
-                results = self.presenter.metadata_provider.search_albums(q_text)
+                try:
+                    results = self.presenter.metadata_provider.search_albums(q_text)
+                    err_msg = None
+                except Exception as e:
+                    results = []
+                    err_msg = str(e)
 
                 def update_ui():
                     btn_search.config(state=tk.NORMAL)
-                    lbl_status.config(text=f"Found {len(results)} album(s).")
-                    for a in results:
-                        albums_cache.append(a)
-                        lst.insert(tk.END, f"{a.album_name} - {a.artist_name} ({a.release_year}, {a.total_tracks} tracks)")
+                    if err_msg:
+                        lbl_status.config(text=f"Error: {err_msg}")
+                    else:
+                        lbl_status.config(text=f"Found {len(results)} album(s).")
+                        for a in results:
+                            albums_cache.append(a)
+                            lst.insert(tk.END, f"{a.album_name} - {a.artist_name} ({a.release_year}, {a.total_tracks} tracks)")
 
                 dlg.after(0, update_ui)
 
