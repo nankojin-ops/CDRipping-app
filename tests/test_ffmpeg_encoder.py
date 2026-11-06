@@ -57,6 +57,8 @@ class TestFFmpegEncoder(unittest.TestCase):
         self.assertEqual(sanitize_filename("CONIN$"), "_CONIN$")
         self.assertEqual(sanitize_filename("CONOUT$"), "_CONOUT$")
         self.assertEqual(sanitize_filename("CON"), "_CON")
+        self.assertEqual(sanitize_filename("COM0"), "_COM0")
+        self.assertEqual(sanitize_filename("LPT0"), "_LPT0")
 
     def test_sanitize_filename_reserved_with_trailing_spaces_and_dots(self):
         """SEC-008: 末尾スペースとピリオド混在時の予約名エスケープバイパス防止"""

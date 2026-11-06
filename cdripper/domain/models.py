@@ -96,7 +96,7 @@ class RipConfig:
     format: EncodeFormat = EncodeFormat.AAC_256K
     selected_speed_x: int = 8
     speed_mode_auto: bool = True
-    filename_template: str = "{track_num:02d} - {title}{ext}"
+    filename_template: str = "{disc_number}-{track_num:02d} {title}{ext}"
 
 
 @dataclass

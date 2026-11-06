@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from typing import Callable, Dict, Optional
@@ -49,6 +50,108 @@ def read_track_sectors(
 
         current_lba += count
         remaining -= count
+
+
+def resolve_track_output_path(
+    base_output_dir: str,
+    disc_number: int,
+    track_number: int,
+    track_title: str,
+    album_artist: Optional[str] = None,
+    album_name: Optional[str] = None,
+    ext: str = ".m4a",
+    filename_template: str = "{disc_number}-{track_num:02d} {title}{ext}",
+    max_component_length: int = 60,
+) -> str:
+    """
+    Resolve hierarchical output path: <base_output_dir>/<safe_artist>/<safe_album>/<safe_filename>
+    with strict sanitization, path traversal prevention, and safe template substitution.
+    """
+    # 1. 厳格な型変換 (CHALLENGE-005)
+    try:
+        disc_num = max(1, int(disc_number))
+    except (ValueError, TypeError):
+        disc_num = 1
+
+    try:
+        trk_num = max(1, int(track_number))
+    except (ValueError, TypeError):
+        trk_num = 1
+
+    def _is_empty_or_placeholder(val: str) -> bool:
+        if not val or val == "Unknown":
+            return True
+        # 禁止文字置換後アンダースコアやスペース、ドットのみしか残っていない場合も空とみなす (TC-NEG-007)
+        return not bool(re.sub(r"[\s_.]", "", val))
+
+    # 2. 空・空白・サニタイズ後の明示的フォールバック (AC-002, CHALLENGE-002)
+    # FIND-SEC-012: 深層ベースディレクトリ時の動的コンポーネント長抑制 (MAX_PATH 260文字対策)
+    abs_base_len = len(os.path.abspath(base_output_dir))
+    remaining_len = max(30, 250 - abs_base_len)
+    eff_comp_len = min(max_component_length, max(10, remaining_len // 3))
+
+    raw_artist = (album_artist or "").strip()
+    safe_artist = sanitize_filename(raw_artist, max_length=eff_comp_len)
+    if _is_empty_or_placeholder(safe_artist):
+        safe_artist = "Unknown Artist"
+
+    raw_album = (album_name or "").strip()
+    safe_album = sanitize_filename(raw_album, max_length=eff_comp_len)
+    if _is_empty_or_placeholder(safe_album):
+        safe_album = "Unknown Album"
+
+    raw_title = (track_title or "").strip()
+    safe_title = sanitize_filename(raw_title, max_length=eff_comp_len)
+    if _is_empty_or_placeholder(safe_title):
+        safe_title = f"Track {trk_num:02d}"
+
+    # 3. Windows ドライブ・大文字小文字・UNC 安全なパストラバーサル防御 (CHALLENGE-001)
+    abs_base = os.path.normcase(os.path.abspath(base_output_dir))
+    target_dir = os.path.abspath(os.path.join(base_output_dir, safe_artist, safe_album))
+    norm_target = os.path.normcase(target_dir)
+
+    try:
+        common = os.path.commonpath([abs_base, norm_target])
+        if common != abs_base:
+            target_dir = os.path.abspath(base_output_dir)
+    except ValueError:
+        # ドライブ文字不一致やUNCパス混在時の安全なフォールバック
+        target_dir = os.path.abspath(base_output_dir)
+
+    # 4. 安全なテンプレートフォーマットとサニタイズ (CHALLENGE-004, CHALLENGE-005, FIND-CR-003)
+    safe_ext = ext if ext.startswith(".") else f".{ext}"
+    fmt_kwargs = {
+        "disc_number": disc_num,
+        "track_num": trk_num,
+        "track_number": trk_num,  # FIND-CR-003: alias for user convenience
+        "title": safe_title,
+        "ext": safe_ext,
+    }
+    try:
+        filename = filename_template.format(**fmt_kwargs)
+    except Exception:
+        filename = f"{disc_num}-{trk_num:02d} {safe_title}{safe_ext}"
+
+    if not filename.endswith(safe_ext):
+        filename = f"{filename}{safe_ext}"
+
+    # ファイル名ベース部（拡張子除く）のNTFS禁止文字置換・最大長制限
+    base_name, f_ext = os.path.splitext(filename)
+    safe_base = sanitize_filename(base_name, max_length=eff_comp_len)
+    filename = f"{safe_base}{f_ext}"
+
+    full_path = os.path.join(target_dir, filename)
+
+    # FIND-SEC-012: Windows MAX_PATH (260文字) 制限対策の多重防御ガード
+    abs_len = len(os.path.abspath(full_path))
+    if abs_len > 255:
+        overflow = abs_len - 255
+        trimmed_base_len = max(4, len(safe_base) - overflow)
+        safe_base = safe_base[:trimmed_base_len]
+        filename = f"{safe_base}{f_ext}"
+        full_path = os.path.join(target_dir, filename)
+
+    return full_path
 
 
 class AudioRipPipeline:
@@ -108,23 +211,26 @@ class AudioRipPipeline:
             custom_tag = track_tags.get(track_num) if track_tags else None
 
             if custom_tag is not None:
-                fmt_track_num = custom_tag.track_number
-                title = custom_tag.title
-                safe_title = sanitize_filename(title)
+                eff_disc_num = custom_tag.disc_number
+                eff_track_num = custom_tag.track_number
+                eff_title = custom_tag.title
+                eff_album_artist = custom_tag.album_artist or custom_tag.artist
+                eff_album = custom_tag.album
                 metadata_dict = custom_tag.to_metadata_dict()
             else:
-                fmt_track_num = track_num
-                title = itunes_meta.track_title if itunes_meta else f"Track {track_num:02d}"
+                eff_disc_num = disc_number
+                eff_track_num = track_num
+                eff_title = itunes_meta.track_title if itunes_meta else f"Track {track_num:02d}"
+                eff_album_artist = (album.album_artist or album.artist_name) if album else (itunes_meta.artist_name if itunes_meta else "")
+                eff_album = album.album_name if album else ""
                 artist = itunes_meta.artist_name if itunes_meta else (album.artist_name if album else "Unknown Artist")
-                album_name = album.album_name if album else "Unknown Album"
                 year = album.release_year if album else ""
                 genre = album.genre if album else ""
-                safe_title = sanitize_filename(title)
 
                 raw_dict = {
-                    "title": title,
+                    "title": eff_title,
                     "artist": artist,
-                    "album": album_name,
+                    "album": eff_album if eff_album else "Unknown Album",
                     "track": f"{track_num}/{total_tracks}",
                     "disc": f"{disc_number}/{album.total_discs if album else 1}",
                     "date": year,
@@ -133,21 +239,23 @@ class AudioRipPipeline:
                 }
                 metadata_dict = {k: v.strip() for k, v in raw_dict.items() if v and v.strip()}
 
-            ext = config.format.extension
-            filename = config.filename_template.format(
-                track_num=fmt_track_num,
-                title=safe_title,
-                ext=ext,
+            output_path = resolve_track_output_path(
+                base_output_dir=config.output_dir,
+                disc_number=eff_disc_num,
+                track_number=eff_track_num,
+                track_title=eff_title,
+                album_artist=eff_album_artist,
+                album_name=eff_album,
+                ext=config.format.extension,
+                filename_template=config.filename_template,
             )
-            if not filename.endswith(ext):
-                filename = f"{filename}{ext}"
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-            output_path = os.path.join(config.output_dir, filename)
-            if output_path in seen_output_paths:
+            if output_path in seen_output_paths or os.path.exists(output_path):
                 base, fext = os.path.splitext(output_path)
                 collision_idx = 1
                 candidate = f"{base}_{collision_idx}{fext}"
-                while candidate in seen_output_paths:
+                while candidate in seen_output_paths or os.path.exists(candidate):
                     collision_idx += 1
                     candidate = f"{base}_{collision_idx}{fext}"
                 output_path = candidate
@@ -186,7 +294,7 @@ class AudioRipPipeline:
                             track_progress_percent=track_pct,
                             overall_progress_percent=overall_pct,
                             current_speed_x=cur_speed,
-                            status_text=f"Ripping Track {track_idx}/{total_tracks}: {title}",
+                            status_text=f"Ripping Track {track_idx}/{total_tracks}: {eff_title}",
                             is_finished=False,
                         )
                     )

@@ -33,8 +33,8 @@ def sanitize_filename(name: str, max_length: int = 120) -> str:
     # Strip trailing dots and spaces BEFORE matching reserved device names (SEC-008)
     sanitized = re.sub(r"[.\s]+$", "", sanitized).strip()
 
-    # FIND-012 (SEC-006): Add CONIN$ and CONOUT$ to reserved pattern
-    reserved_pattern = r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$)(\..*)?$"
+    # FIND-012 (SEC-006, SEC-015): Add CONIN$, CONOUT$, COM0, LPT0 to reserved pattern
+    reserved_pattern = r"^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]|CONIN\$|CONOUT\$)(\..*)?$"
     if re.match(reserved_pattern, sanitized, re.IGNORECASE):
         sanitized = f"_{sanitized}"
 

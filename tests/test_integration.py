@@ -58,12 +58,17 @@ class TestIntegrationE2E(unittest.TestCase):
             cancel_event=cancel,
         )
 
-        # 出力ファイルの存在確認
-        files = os.listdir(self.test_dir)
+        # 出力ファイルの存在確認 (<output_dir>/The Beatles/Abbey Road/)
+        target_album_dir = os.path.join(self.test_dir, "The Beatles", "Abbey Road")
+        self.assertTrue(os.path.isdir(target_album_dir), f"Directory not found: {target_album_dir}")
+
+        files = os.listdir(target_album_dir)
         m4a_files = [f for f in files if f.endswith(".m4a")]
         self.assertEqual(len(m4a_files), 2)
-        track1_file = [f for f in m4a_files if "Come Together" in f][0]
-        track1_path = os.path.join(self.test_dir, track1_file)
+        self.assertIn("1-01 Come Together.m4a", m4a_files)
+        self.assertIn("1-02 Something.m4a", m4a_files)
+
+        track1_path = os.path.join(target_album_dir, "1-01 Come Together.m4a")
 
         # ファイルサイズがAAC 256k相当（1秒で > 5KB）であること
         self.assertGreater(os.path.getsize(track1_path), 5000)
@@ -152,14 +157,24 @@ class TestIntegrationE2E(unittest.TestCase):
         )
 
         # ファイル名がサニタイズされて存在すること (AC-005)
-        files = os.listdir(self.test_dir)
-        m4a_files = [f for f in files if f.endswith(".m4a")]
-        self.assertEqual(len(m4a_files), 2)
+        # トラック1は "Custom Artist 1/Custom Compilation Vol. 1/1-01 AC_DC_ Live _Special_ _Edition_.m4a"
+        target_album_dir = os.path.join(self.test_dir, "Custom Artist 1", "Custom Compilation Vol. 1")
+        self.assertTrue(os.path.isdir(target_album_dir), f"Directory not found: {target_album_dir}")
 
-        # Track 1 file: "01 - AC_DC_ Live _Special_ _Edition_.m4a"
-        trk1_files = [f for f in m4a_files if f.startswith("01 - ")]
+        files = os.listdir(target_album_dir)
+        m4a_files = [f for f in files if f.endswith(".m4a")]
+        self.assertEqual(len(m4a_files), 1)
+
+        # Track 1 file: "1-01 AC_DC_ Live _Special_ _Edition_.m4a"
+        trk1_files = [f for f in m4a_files if f.startswith("1-01 ")]
         self.assertEqual(len(trk1_files), 1)
-        track1_path = os.path.join(self.test_dir, trk1_files[0])
+        track1_path = os.path.join(target_album_dir, trk1_files[0])
+
+        # トラック2は別アルバムフォルダに出力されること
+        target_album_dir2 = os.path.join(self.test_dir, "Ludwig van Beethoven", "Classical Favorites")
+        self.assertTrue(os.path.isdir(target_album_dir2), f"Directory not found: {target_album_dir2}")
+        files2 = os.listdir(target_album_dir2)
+        self.assertIn("1-02 Moonlight Sonata.m4a", files2)
 
         # ffprobe で全8項目タグを実測検証 (AC-003)
         ffprobe_bin = shutil.which("ffprobe")
