@@ -12,16 +12,21 @@ from typing import List, Optional
 
 from cdripper.domain.models import (
     AlbumMetadata,
+    AlbumTagData,
     BusType,
     DiscTOC,
     DriveInfo,
     EncodeFormat,
     RipConfig,
     RipProgress,
+    TrackTagData,
 )
 from cdripper.hardware.speed_optimizer import DriveSpeedOptimizer
 from cdripper.metadata.itunes_client import ITunesApiClient
+from cdripper.ui.album_tag_dialog import AlbumTagEditDialog
+from cdripper.ui.artwork_helper import create_photo_image
 from cdripper.ui.presenter import CDRipperPresenter, PresenterEvent
+from cdripper.ui.tag_dialog import TrackTagEditDialog
 
 
 def set_high_dpi_awareness():
@@ -47,6 +52,8 @@ class CDRipperAppView:
         self.root.minsize(800, 600)
 
         self._artwork_photo: Optional[tk.PhotoImage] = None  # GC prevention (FIND-003)
+        self._tag_dialog_instance: Optional[TrackTagEditDialog] = None  # Singleton dialog (CHALLENGE-005)
+        self._album_dialog_instance: Optional[AlbumTagEditDialog] = None  # FIND-005
 
         self._init_ui()
         self._start_queue_polling()
@@ -87,10 +94,12 @@ class CDRipperAppView:
         ttk.Label(meta_frame, text="Album:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
         self.txt_album = ttk.Entry(meta_frame, width=30)
         self.txt_album.grid(row=0, column=1, sticky=tk.W, padx=5, pady=2)
+        self.txt_album.bind("<FocusOut>", self._on_album_artist_focus_out)
 
         ttk.Label(meta_frame, text="Artist:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=2)
         self.txt_artist = ttk.Entry(meta_frame, width=25)
         self.txt_artist.grid(row=0, column=3, sticky=tk.W, padx=5, pady=2)
+        self.txt_artist.bind("<FocusOut>", self._on_album_artist_focus_out)
 
         self.btn_itunes_search = ttk.Button(meta_frame, text="Search iTunes...", command=self._open_search_dialog)
         self.btn_itunes_search.grid(row=0, column=4, padx=10, pady=2)
@@ -115,6 +124,8 @@ class CDRipperAppView:
         self.tree.column("duration", width=70, anchor=tk.CENTER)
         self.tree.column("status", width=90, anchor=tk.W)
 
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+
         tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=tree_scroll.set)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -124,6 +135,11 @@ class CDRipperAppView:
         art_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
         self.art_canvas = tk.Canvas(art_frame, width=150, height=150, bg="#e0e0e0")
         self.art_canvas.pack(pady=5)
+        self.art_canvas.bind("<Button-1>", lambda _e: self._open_album_tag_dialog())
+        try:
+            self.art_canvas.config(cursor="hand2")
+        except Exception:
+            pass
         self._draw_no_artwork()
 
         enc_frame = ttk.Frame(self.root, padding=10)
@@ -131,14 +147,14 @@ class CDRipperAppView:
 
         ttk.Label(enc_frame, text="Format:").pack(side=tk.LEFT, padx=5)
         self.format_var = tk.StringVar(value=EncodeFormat.AAC_256K.value)
-        format_combo = ttk.Combobox(
+        self.format_combo = ttk.Combobox(
             enc_frame,
             textvariable=self.format_var,
             state="readonly",
             values=[f.value for f in EncodeFormat],
             width=22,
         )
-        format_combo.pack(side=tk.LEFT, padx=5)
+        self.format_combo.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(enc_frame, text="Output Folder:").pack(side=tk.LEFT, padx=(15, 5))
         default_music = os.path.join(os.path.expanduser("~"), "Music", "CDRipOutput")
@@ -148,6 +164,12 @@ class CDRipperAppView:
 
         ctrl_frame = ttk.Frame(self.root, padding=10)
         ctrl_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.btn_edit_album = ttk.Button(ctrl_frame, text="Edit Album Tags...", command=self._open_album_tag_dialog)
+        self.btn_edit_album.pack(side=tk.LEFT, padx=5)
+
+        self.btn_edit_tags = ttk.Button(ctrl_frame, text="Edit Track Tags...", command=self._on_edit_tags_clicked)
+        self.btn_edit_tags.pack(side=tk.LEFT, padx=5)
 
         self.btn_start_rip = ttk.Button(ctrl_frame, text="Start Ripping", command=self._on_start_rip)
         self.btn_start_rip.pack(side=tk.LEFT, padx=5)
@@ -180,7 +202,18 @@ class CDRipperAppView:
 
     def _draw_no_artwork(self):
         self.art_canvas.delete("all")
-        self.art_canvas.create_text(75, 75, text="No Artwork\n(1200x1200bb)", fill="#888888", justify=tk.CENTER)
+        self.art_canvas.create_text(75, 75, text="No Artwork\n(Click to Edit)", fill="#888888", justify=tk.CENTER)
+
+    def _update_artwork_canvas(self, artwork_data: Optional[bytes]):
+        """Render artwork image onto canvas with Pillow thumbnail scaling (AC-001)."""
+        if artwork_data:
+            photo = create_photo_image(artwork_data, max_size=(150, 150))
+            if photo:
+                self._artwork_photo = photo
+                self.art_canvas.delete("all")
+                self.art_canvas.create_image(75, 75, image=self._artwork_photo)
+                return
+        self._draw_no_artwork()
 
     def _start_queue_polling(self):
         def poll():
@@ -194,6 +227,25 @@ class CDRipperAppView:
                 self.root.after(50, poll)
 
         self.root.after(50, poll)
+
+    def _set_ripping_ui_state(self, is_ripping: bool):
+        """Enable or disable all UI controls during ripping (CHALLENGE-002, TC-STATE-001, 006, FIND-005)."""
+        state = tk.DISABLED if is_ripping else tk.NORMAL
+        combo_state = "disabled" if is_ripping else "readonly"
+
+        self.drive_combo.config(state=combo_state)
+        self.btn_refresh_drive.config(state=state)
+        self.btn_virtual_drive.config(state=state)
+        self.speed_combo.config(state=combo_state)
+        self.txt_album.config(state=state)
+        self.txt_artist.config(state=state)
+        self.btn_itunes_search.config(state=state)
+        self.format_combo.config(state=combo_state)
+        self.txt_outdir.config(state=state)
+        self.btn_edit_album.config(state=state)
+        self.btn_edit_tags.config(state=state)
+        self.btn_start_rip.config(state=tk.DISABLED if is_ripping else tk.NORMAL)
+        self.btn_cancel.config(state=tk.NORMAL if is_ripping else tk.DISABLED)
 
     def _handle_presenter_event(self, event: str, payload):
         if event == PresenterEvent.DRIVES_LOADED:
@@ -217,18 +269,19 @@ class CDRipperAppView:
             self.txt_artist.delete(0, tk.END)
             self.txt_artist.insert(0, album.artist_name)
             self._update_tracks_with_metadata(album)
+            self._update_artwork_canvas(album.artwork_data)
 
-            # FIND-003 (REV-003): Display artwork preview safely
-            if album.artwork_data:
-                try:
-                    b64 = base64.b64encode(album.artwork_data).decode("ascii")
-                    self._artwork_photo = tk.PhotoImage(data=b64)
-                    self.art_canvas.delete("all")
-                    self.art_canvas.create_image(75, 75, image=self._artwork_photo)
-                except Exception:
-                    self._draw_no_artwork()
-            else:
-                self._draw_no_artwork()
+        elif event == PresenterEvent.ALBUM_TAGS_UPDATED:
+            album_data: AlbumTagData = payload
+            self.txt_album.delete(0, tk.END)
+            self.txt_album.insert(0, album_data.album)
+            self.txt_artist.delete(0, tk.END)
+            self.txt_artist.insert(0, album_data.album_artist or self.txt_artist.get())
+            self._update_artwork_canvas(album_data.artwork_data)
+
+        elif event == PresenterEvent.TRACK_TAG_UPDATED:
+            track_num, tag_data = payload
+            self._update_tree_row_with_tag(track_num, tag_data)
 
         elif event == PresenterEvent.PROGRESS_UPDATE:
             prog: RipProgress = payload
@@ -237,8 +290,7 @@ class CDRipperAppView:
             self.lbl_status.config(text=f"{prog.status_text} (Speed: {prog.current_speed_x:.1f}x)")
 
             if prog.is_finished:
-                self.btn_start_rip.config(state=tk.NORMAL)
-                self.btn_cancel.config(state=tk.DISABLED)
+                self._set_ripping_ui_state(False)
                 if prog.error_message:
                     messagebox.showerror("Ripping Error", prog.error_message)
                 else:
@@ -248,84 +300,158 @@ class CDRipperAppView:
             self._append_log(str(payload))
 
         elif event == PresenterEvent.ERROR:
-            # FIND-001 (REV-001): Restore button states on error
-            self.btn_start_rip.config(state=tk.NORMAL)
-            self.btn_cancel.config(state=tk.DISABLED)
-            self._append_log(f"ERROR: {payload}")
             messagebox.showwarning("Notice", str(payload))
-
-    def _on_drive_selected(self, _event):
-        val = self.drive_var.get()
-        if not val or " - " not in val:
-            return
-        letter = val.split(" - ")[0]
-        self.presenter.select_drive(letter)
-
-        matched = [d for d in self.presenter.current_drives if d.drive_letter == letter]
-        if matched:
-            d = matched[0]
-            rec = DriveSpeedOptimizer.calculate_recommended_speed(d)
-            # FIND-015 (REV-008): Format speed label based on BusType
-            if d.bus_type == BusType.USB:
-                bus_label = "External USB Safe"
-            elif d.bus_type == BusType.SATA:
-                bus_label = "SATA Internal"
-            elif d.bus_type == BusType.ATAPI:
-                bus_label = "ATAPI Internal"
-            elif d.bus_type == BusType.VIRTUAL:
-                bus_label = "Virtual CD Mode"
-            else:
-                bus_label = "Standard Safe"
-            self.lbl_speed_info.config(text=f"Recommended: {rec}x ({bus_label})")
-
-    def _on_toggle_virtual(self):
-        self.presenter.switch_to_virtual_drive()
+            self._set_ripping_ui_state(False)
 
     def _display_toc(self, toc: DiscTOC):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
+        self.tree.delete(*self.tree.get_children())
         for t in toc.tracks:
-            mins = int(t.duration_seconds // 60)
-            secs = int(t.duration_seconds % 60)
-            time_str = f"{mins:02d}:{secs:02d}"
+            dur_min = int(t.duration_seconds // 60)
+            dur_sec = int(t.duration_seconds % 60)
+            dur_str = f"{dur_min:02d}:{dur_sec:02d}"
+            tag = self.presenter.get_track_tag(t.track_number)
+            title = tag.title if tag else f"Track {t.track_number:02d}"
+            artist = tag.artist if tag else "Unknown Artist"
             self.tree.insert(
                 "",
                 tk.END,
-                values=(t.track_number, f"Track {t.track_number:02d}", "Unknown Artist", time_str, "Ready"),
+                values=(t.track_number, title, artist, dur_str, "Ready"),
             )
 
     def _update_tracks_with_metadata(self, album: AlbumMetadata):
-        # FIND-002: Safely handles toc is None
-        matched_tracks, is_complete = ITunesApiClient.match_tracks_with_toc(
-            self.presenter.current_toc, album, self.presenter.selected_disc
-        )
-        if self.presenter.current_toc and not is_complete:
-            self._append_log("Warning: Track count or duration mismatch with CD TOC.")
+        for item_id in self.tree.get_children():
+            vals = list(self.tree.item(item_id, "values"))
+            track_num = int(vals[0])
+            tag = self.presenter.get_track_tag(track_num)
+            if tag:
+                vals[1] = tag.title
+                vals[2] = tag.artist
+                self.tree.item(item_id, values=vals)
 
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+    def _on_drive_selected(self, _event):
+        sel_text = self.drive_var.get()
+        if sel_text and " - " in sel_text:
+            letter = sel_text.split(" - ")[0].strip()
+            self.presenter.select_drive(letter)
+            rec_speed = DriveSpeedOptimizer.RECOMMENDED_SAFE_SPEED_X
+            self.lbl_speed_info.config(text=f"Recommended: {rec_speed}x (External USB Safe)")
 
-        for toc_track, itunes_track in matched_tracks:
-            if toc_track:
-                mins = int(toc_track.duration_seconds // 60)
-                secs = int(toc_track.duration_seconds % 60)
-                time_str = f"{mins:02d}:{secs:02d}"
-                trk_num = toc_track.track_number
-            else:
-                duration_sec = (itunes_track.duration_millis / 1000.0) if itunes_track else 0.0
-                mins = int(duration_sec // 60)
-                secs = int(duration_sec % 60)
-                time_str = f"{mins:02d}:{secs:02d}"
-                trk_num = itunes_track.track_number if itunes_track else 1
+    def _on_toggle_virtual(self):
+        self.presenter.switch_to_virtual_drive(has_media=True)
+        self.lbl_speed_info.config(text="Mode: Virtual CD (High Speed In-Memory Testing)")
 
-            title = itunes_track.track_title if itunes_track else f"Track {trk_num:02d}"
-            artist = itunes_track.artist_name if itunes_track else album.artist_name
-            self.tree.insert(
-                "",
-                tk.END,
-                values=(trk_num, title, artist, time_str, "Ready"),
+    def _on_tree_double_click(self, _event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        vals = self.tree.item(sel[0], "values")
+        track_number = int(vals[0])
+        self._open_tag_edit_dialog(track_number)
+
+    def _on_edit_tags_clicked(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Notice", "Please select a track from the list first.")
+            return
+        vals = self.tree.item(sel[0], "values")
+        track_number = int(vals[0])
+        self._open_tag_edit_dialog(track_number)
+
+    def _open_album_tag_dialog(self):
+        """Open Album Tag Edit Dialog with mutual exclusion and rip lock (AC-002, FIND-005)."""
+        if self.presenter.is_ripping:
+            return
+
+        # Mutual exclusion: if track dialog is open, lift it instead
+        if self._tag_dialog_instance and self._tag_dialog_instance.winfo_exists():
+            self._tag_dialog_instance.lift()
+            self._tag_dialog_instance.focus_force()
+            return
+
+        # Single instance guard for album dialog
+        if self._album_dialog_instance and self._album_dialog_instance.winfo_exists():
+            self._album_dialog_instance.lift()
+            self._album_dialog_instance.focus_force()
+            return
+
+        # Synthesize initial AlbumTagData
+        curr_album = self.presenter.current_album
+        first_tag = next(iter(self.presenter.track_tags.values()), None)
+
+        disc_no = self.presenter.selected_disc
+        total_discs = curr_album.total_discs if curr_album else (first_tag.total_discs if first_tag else 1)
+        album_title = curr_album.album_name if curr_album else (first_tag.album if first_tag else self.txt_album.get())
+        album_artist = curr_album.album_artist if (curr_album and curr_album.album_artist) else (
+            first_tag.album_artist if (first_tag and first_tag.album_artist) else (
+                curr_album.artist_name if curr_album else self.txt_artist.get()
             )
+        )
+        date_val = curr_album.release_year if curr_album else (first_tag.date if first_tag else "")
+        genre_val = curr_album.genre if curr_album else (first_tag.genre if first_tag else "")
+        art_data = curr_album.artwork_data if curr_album else None
+
+        initial_data = AlbumTagData(
+            disc_number=disc_no,
+            total_discs=total_discs,
+            album_artist=album_artist,
+            album=album_title,
+            date=date_val,
+            genre=genre_val,
+            artwork_data=art_data,
+        )
+
+        def on_close():
+            self._album_dialog_instance = None
+
+        self._album_dialog_instance = AlbumTagEditDialog(
+            parent=self.root,
+            album_data=initial_data,
+            on_save_callback=self.presenter.update_album_tags,
+            on_close_callback=on_close,
+        )
+
+    def _open_tag_edit_dialog(self, track_number: int):
+        if self.presenter.is_ripping:
+            return
+
+        # Mutual exclusion: if album dialog is open, lift it instead
+        if self._album_dialog_instance and self._album_dialog_instance.winfo_exists():
+            self._album_dialog_instance.lift()
+            self._album_dialog_instance.focus_force()
+            return
+
+        if self._tag_dialog_instance and self._tag_dialog_instance.winfo_exists():
+            self._tag_dialog_instance.lift()
+            self._tag_dialog_instance.focus_force()
+            return
+
+        def on_close():
+            self._tag_dialog_instance = None
+
+        self._tag_dialog_instance = TrackTagEditDialog(
+            parent=self.root,
+            track_number=track_number,
+            presenter=self.presenter,
+            on_save_callback=self._on_track_tag_saved,
+            on_close_callback=on_close,
+        )
+
+    def _on_track_tag_saved(self, track_number: int, tag_data: TrackTagData):
+        self._update_tree_row_with_tag(track_number, tag_data)
+
+    def _update_tree_row_with_tag(self, track_number: int, tag_data: TrackTagData):
+        for item_id in self.tree.get_children():
+            vals = list(self.tree.item(item_id, "values"))
+            if int(vals[0]) == track_number:
+                vals[1] = tag_data.title
+                vals[2] = tag_data.artist
+                self.tree.item(item_id, values=vals)
+                break
+
+    def _on_album_artist_focus_out(self, _event):
+        album = self.txt_album.get()
+        artist = self.txt_artist.get()
+        self.presenter.sync_album_artist_to_uncustomized(album, artist)
 
     def _open_search_dialog(self):
         query = self.txt_album.get() or self.txt_artist.get() or "The Beatles"
@@ -349,7 +475,6 @@ class CDRipperAppView:
 
         albums_cache: List[AlbumMetadata] = []
 
-        # FIND-006 (REV-004): Asynchronous non-blocking iTunes search
         def do_search():
             q_text = txt_q.get()
             btn_search.config(state=tk.DISABLED)
@@ -388,50 +513,65 @@ class CDRipperAppView:
                 return
             idx = sel[0]
             chosen = albums_cache[idx]
-            self.presenter.apply_album_metadata(chosen.collection_id)
+
+            overwrite = True
+            if self.presenter.has_customized_tracks():
+                overwrite = messagebox.askyesno(
+                    "Overwrite Confirmation",
+                    "Some tracks have custom metadata edits. Overwrite all customized tracks with iTunes metadata?",
+                    parent=dlg,
+                )
+
+            self.presenter.apply_album_metadata(chosen.collection_id, overwrite_customized=overwrite)
             dlg.destroy()
 
         btn_apply = ttk.Button(dlg, text="Apply Selected Album", command=on_select)
-        btn_apply.pack(pady=10)
-
-        do_search()
+        btn_apply.pack(pady=5)
 
     def _on_start_rip(self):
-        # FIND-001 (REV-001): Guard against starting without a loaded TOC
         if not self.presenter.current_toc:
-            messagebox.showwarning("Notice", "No CD loaded or TOC available to rip.")
-            self.btn_start_rip.config(state=tk.NORMAL)
-            self.btn_cancel.config(state=tk.DISABLED)
+            messagebox.showwarning("Notice", "No disc inserted or TOC not loaded.")
             return
 
-        out_dir = self.txt_outdir.get().strip()
-        if not out_dir:
-            messagebox.showerror("Error", "Please specify an output folder.")
+        outdir = self.txt_outdir.get().strip()
+        if not outdir:
+            messagebox.showwarning("Notice", "Please specify an output folder.")
             return
 
-        fmt = EncodeFormat(self.format_var.get())
+        fmt_str = self.format_var.get()
+        chosen_fmt = EncodeFormat.AAC_256K
+        for f in EncodeFormat:
+            if f.value == fmt_str:
+                chosen_fmt = f
+                break
+
         speed_str = self.speed_var.get()
-        if speed_str.startswith("Auto"):
-            speed = (
-                self.presenter.selected_drive.recommended_speed_x
-                if self.presenter.selected_drive
-                else 8
-            )
-        else:
-            speed = int(speed_str.replace("x", "").replace("Max", "24"))
+        speed_x = 8
+        if "4x" in speed_str:
+            speed_x = 4
+        elif "8x" in speed_str:
+            speed_x = 8
+        elif "12x" in speed_str:
+            speed_x = 12
+        elif "16x" in speed_str:
+            speed_x = 16
+        elif "24x" in speed_str:
+            speed_x = 24
+        elif "Max" in speed_str:
+            speed_x = 0
 
         config = RipConfig(
-            output_dir=out_dir,
-            format=fmt,
-            selected_speed_x=speed,
+            output_dir=outdir,
+            format=chosen_fmt,
+            selected_speed_x=speed_x,
+            speed_mode_auto=("Auto" in speed_str),
         )
 
-        self.btn_start_rip.config(state=tk.DISABLED)
-        self.btn_cancel.config(state=tk.NORMAL)
+        self._set_ripping_ui_state(True)
         self.presenter.start_ripping(config)
 
     def _append_log(self, text: str):
         self.txt_log.config(state=tk.NORMAL)
-        self.txt_log.insert(tk.END, f"{text}\n")
+        self.txt_log.insert(tk.END, text + "\n")
         self.txt_log.see(tk.END)
         self.txt_log.config(state=tk.DISABLED)

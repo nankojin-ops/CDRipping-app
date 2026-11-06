@@ -1,74 +1,70 @@
 # Task Brief
 
 - Task ID: cd-ripping-app-002
-- Title: DAEMON Tools等の仮想ドライブおよびSPTI転送上限に起因する MMC READ CD Win32 エラー 87 (ERROR_INVALID_PARAMETER) の解消
-- Requester / owner: User
+- Title: トラック毎の全項目タグ編集機能の追加
+- Requester / owner: ユーザー
 - Date: 2026-11-06
-- Risk level: High (ハードウェアI/O、SCSIパススルー、リッピングコア機能の安定性に直結)
-- Target revision / initial working tree: 33cbad8c2e277b89eb0747cbff2c17fa98c7e1e1 (Working tree clean)
+- Risk level: Medium
+- Target revision / initial working tree: 2897a50 (working tree clean)
 
 ## Background and goal
-ユーザーが DAEMON Tools（仮想CDドライブ）を使用してマウントしたオーディオCDからリッピングを開始した際、以下のエラーが発生した：
-「MMC READ CD failed. Win32 error: 87」
-（ダイアログ「Ripping failed: Ripping failed on track 1: MMC READ CD failed. Win32 error: 87」）
-
-調査結果：
-1. Win32 Error 87 は `ERROR_INVALID_PARAMETER` (不正なパラメータ)。
-2. `IOCTL_CDROM_RAW_READ` が仮想ドライブ（DAEMON Toolsなど）でサポートされず（Error 1: ERROR_INVALID_FUNCTION）、`_read_cd_mmc` (`IOCTL_SCSI_PASS_THROUGH_DIRECT`, CDB 0xBE READ CD) にフォールバックする。
-3. `rip_pipeline.py` において、`read_track_sectors` の `batch_size` が固定値 75（75セクタ × 2352バイト = 176,400 バイト ≈ 172.2 KB）となっている。
-4. Windows のストレージスタック（SPTI）およびデバイスアダプタ（DAEMON Toolsの仮想アダプタ、USB CDドライブのUSBストレージアダプタ等）には `MaximumTransferLength` の上限が存在する。
-   - DAEMON Tools 仮想ドライブ (D:): `MaximumTransferLength = 131,072 バイト` (128 KB, 最大55セクタ)
-   - USB 光学ドライブ (F:): `MaximumTransferLength = 65,536 バイト` (64 KB, 最大27セクタ)
-5. 75セクタ（176,400 バイト）のリクエストは `MaximumTransferLength`（131,072 バイト）を超過するため、Windows カーネル (storport / cdrom.sys) または仮想ミニポートドライバが `STATUS_INVALID_PARAMETER` (Win32 エラー 87) を返し、読み込みが失敗する。
-
-本タスクの目的は、DAEMON Tools などの仮想CDドライブや、転送サイズ制限が厳しい USB / SATA 光学ドライブにおいて、`MaximumTransferLength` を動的に考慮し、安全なチャンクサイズ（例: 24〜27セクタ以下）に自動分割して読み込む仕組みを導入し、Win32 error 87 を完全に解消することである。
+現状のCD Ripping Appでは、アルバム単位でAlbum名およびArtist名が入力可能であり、トラックタイトルはiTunes検索結果または "Track 01" 等のデフォルト値から一律に生成されていた。
+本タスクでは、ユーザーがCDリッピング実行前にトラック毎にタグ情報を個別に確認・編集できるようにし、システムが音声ファイルに書き込む全タグ項目（title, artist, album, track, disc, date, genre, encoder）をトラック単位でカスタマイズ可能にすることを目的とする。
 
 ## In scope
-1. `spti_drive.py` におけるアダプタ最大転送長の動的検出 (`StorageAdapterProperty`) と安全な既定値（デフォルト25セクタ = 約58.8KB、または最大転送長に応じたセクタ数）の算出。
-2. `spti_drive.py` の `read_sectors_raw` および `_read_cd_mmc` において、要求セクタ数が単一転送上限を超える場合に、自動的に安全なチャンクサイズへ分割して順次読み込み・結合して返す透過的チャンク分割機構の実装。
-3. `rip_pipeline.py` の `batch_size` を 25〜27 セクタ程度（約60KB、1/3秒単位）に見直し、プログレス更新の滑らかさと単一転送の安全性を両立。
-4. DAEMON Tools などの仮想ドライブおよび物理ドライブでの動作確認、ユニットテスト・統合テストの追加・更新。
-5. エラーハンドリングの強化（転送エラー時の詳細ログ、わかりやすいエラーメッセージ）。
+1. トラック単位のタグ情報データモデルの定義・拡張（全8項目：title, artist, album, track, disc, date, genre, encoder）。
+2. UI（`CDRipperAppView`）におけるトラック毎タグ編集機能の実装：
+   - トラック一覧（Treeview）での選択・ダブルクリックまたは編集ボタンからのタグ編集ダイアログ（Modal Dialog）の提供。
+   - ダイアログ上でシステムが書き込む全8項目（title, artist, album, track, disc, date, genre, encoder）の表示・編集・保存機能。
+   - 編集されたトラック情報のTreeview（一覧）への反映表示。
+3. Presenter層におけるトラックタグ状態管理の追加（初期化、個別更新、一括リセット/メタデータ適用時の連携）。
+4. リッピングパイプライン（`AudioRipPipeline`）へのトラック個別タグの受け渡しと、FFmpegエンコーダへの正確なメタデータ反映。
+5. 出力ファイル名への編集後タイトル・トラック番号の反映。
+6. 単体テストおよび統合テストの追加・更新。
 
 ## Out of scope
-- DAEMON Tools 自体のドライバ内部の変更
-- CCCD等のコピープロテクト解除
-- GUI デザインの大幅変更
+- トラックごとの個別アートワーク（画像）差し替え（アルバム単位のアートワーク管理は既存仕様を維持）。
+- 外部音楽タグエディタ（MusicBrainz Picard等）との連携プロトコル。
+- 物理光学ドライブの挙動変更。
 
 ## Functional requirements
 | Requirement ID | Requirement | Priority | Notes |
 |---|---|---|---|
-| REQ-001 | DAEMON Tools等の仮想ドライブでマウントされたオーディオCDから正常にセクタデータを読み取れること | P0 | Win32 error 87 が発生しないこと |
-| REQ-002 | `spti_drive.py` が要求されたセクタ数をアダプタの安全な最大転送サイズ（`max_transfer_sectors`）以下に自動分割して読み込めること | P0 | 75セクタ以上の要求でも安全に結合して返却 |
-| REQ-003 | ドライブオープン時に `StorageAdapterProperty` をクエリし、`MaximumTransferLength` に応じた適切なチャンクサイズを動的に決定すること（取得失敗時は安全な既定値 25 セクタ ≈ 58.8KB を採用） | P1 | USB(64KB)やDAEMON Tools(128KB)に対応 |
-| REQ-004 | `rip_pipeline.py` のデフォルト `batch_size` を安全なサイズ（25セクタ）に設定し、進捗更新を高頻度かつ安全に行うこと | P1 | プログレス表示の体感向上 |
-| REQ-005 | MMC READ CD が万一完全にサポートされないドライブやアクセス拒否時のエラーハンドリングが明確であること | P2 | 適切な例外メッセージの表示 |
+| REQ-001 | トラック一覧でトラックを選択し、タグ編集ダイアログを開いてシステムが書き込む全項目（title, artist, album, track, disc, date, genre, encoder）を編集できること | P1 | ダブルクリックまたは編集ボタン |
+| REQ-002 | トラック毎に異なるタグ（アーティスト、アルバム、ジャンル、リリース年等）を保持し、個別保存できること | P1 | コンピレーション等に対応 |
+| REQ-003 | トラック番号（track）およびディスク番号（disc）は "X/Y" 形式（またはトラック番号と総数の個別入力）で編集・検証できること | P1 | FFmpegタグ形式 "track=1/12", "disc=1/1" |
+| REQ-004 | 編集したタグ情報がリッピング実行時にFFmpegエンコード引数（`-metadata`）へ正確に適用されること | P1 | 全項目反映 |
+| REQ-005 | 編集後のトラックタイトルおよびトラック番号が出力ファイル名（filename_template）に安全に反映されること | P1 | NTFSサニタイズ経由 |
+| REQ-006 | iTunesメタデータ取得時やTOC読み込み時に各トラックのタグ初期値が適切に生成・設定されること | P2 | 既定値からのシームレスな編集 |
 
 ## Non-functional requirements
-- NFR-001: 安定性 - いかなるセクタ数要求（1セクタ〜数百セクタ）に対しても、ドライバの転送制限を超えて Win32 error 87 を発生させない。
-- NFR-002: 互換性 - 物理内蔵ドライブ (SATA/ATAPI)、外付けUSBドライブ、仮想ドライブ (DAEMON Tools, Virtual CloneDrive等) のすべてで動作すること。
-- NFR-003: 性能 - 小さすぎるチャンク（1セクタ単位など）によるシステムコールのオーバーヘッドを避け、25〜55セクタ程度の効率的なバッチサイズを維持すること。
-- NFR-004: 保守性・テスト性 - 物理ドライブや仮想ドライブが存在しないCI環境でも、チャンク分割ロジックをユニットテストで100%検証可能とすること。
+- スレッドセーフティ: GUIスレッドとリッピングワーカースレッド間での安全なデータ参照。
+- 入力値検証とサニタイズ: 空白文字、制御文字、不正な番号フォーマットに対する安全なハンドリング。
+- 高DPI対応: 新規追加するダイアログが高DPI環境で適切にスケーリングすること。
+- テスト網羅性: モデル、Presenter、UIダイアログ、パイプライン、統合エンコードの全層での単体・統合テスト。
 
 ## Constraints and compatibility
-- OS: Windows 10/11
-- ランタイム: Python 3.10+ (環境は Python 3.14.8 利用可能)
-- Win32 API: `DeviceIoControl` (`IOCTL_STORAGE_QUERY_PROPERTY`, `IOCTL_SCSI_PASS_THROUGH_DIRECT`)
-- 既存テストスイートの全パスを維持。
+- Python 3.14 / Tkinter / FFmpeg 既存環境との完全互換。
+- 外部サードパーティライブラリ（pip追加）なし。
+- 既存の68テストが全件パスし、リグレッションがないこと。
 
 ## Acceptance criteria
 | Acceptance ID | Given / When / Then or measurable condition | Verification method |
 |---|---|---|
-| AC-001 | DAEMON Toolsの仮想ドライブ (D:) に対し、`read_sectors_raw(0, 75)` を実行した際、Win32 error 87 が発生せず、75 * 2352 バイトのデータが正常に取得できること | 実機D:ドライブでの読み取りテスト |
-| AC-002 | `read_sectors_raw` に 100 や 150 などアダプタ上限を超えるセクタ数を指定しても、透過的にチャンク分割されて正確なバイト数が返されること | ユニットテストおよび実機テスト |
-| AC-003 | リッピングパイプライン (`rip_pipeline.py`) を通じてDAEMON Toolsのトラック1（または全トラック）のエンコードがエラーなく進行・完了すること | 実機D:ドライブでのリッピング実行テスト |
-| AC-004 | 既存のユニットテスト・統合テスト（48テスト）がすべてパスし、回帰が発生していないこと | `python -m unittest discover tests` |
-| AC-005 | チャンク分割およびアダプタプロパティ取得をカバーする新規ユニットテストが追加され、パスすること | 新規テスト実行 |
+| AC-001 | トラック一覧でトラックを選択して編集ダイアログを開いた時、システムが書き込む全項目（title, artist, album, track, disc, date, genre, encoder）の現在値が表示され編集できること | 自動テスト（UI/Presenter） & 手動UI確認 |
+| AC-002 | 編集ダイアログで全項目を変更して保存した時、そのトラックのタグ情報が更新され、トラック一覧の表示（title, artist等）にも即時反映されること | 自動テスト（Presenter/View） |
+| AC-003 | トラック毎に異なるアルバム名・アーティスト名・年・ジャンル・エンコーダ等を設定してリッピングを実行した時、生成された各ファイルのメタデータ（ffprobe検証）に各トラックの編集値が反映されていること | 統合テスト（test_integration.py / ffprobe） |
+| AC-004 | トラック番号・ディスク番号の編集（"2/10" や "1/2" など）が正しくパース・検証され、FFmpegタグに渡されること | 単体テスト（test_rip_pipeline / test_ffmpeg_encoder） |
+| AC-005 | トラックタイトルにNTFS禁止文字（`\ / : * ? " < > |`）や特殊文字が含まれる場合でも、ファイル名はサニタイズされつつタグには元の文字列が保持されること | 単体テスト（test_ffmpeg_encoder / pipeline） |
+| AC-006 | 既存の全68テストが一切のリグレッションなくPASSすること | `py -3 -m unittest discover` |
+
+## Assumptions / unresolved questions
+- 前提: システムが書き込むタグ項目は `title`, `artist`, `album`, `track`, `disc`, `date`, `genre`, `encoder` の8項目である。
+- トラック番号・ディスク番号の入力UI: ユーザーが直感的に編集できるよう、`トラック番号 / 総トラック数`、`ディスク番号 / 総ディスク数` のように個別または "X/Y" 形式で編集可能にする。
 
 ## Existing user changes to preserve
-- 作業ツリーはクリーン（未コミット変更なし）。既存ファイル構造とコーディング規約を維持。
+- 作業ツリーはクリーン（変更なし）。
 
 ## Approved commands / environment restrictions
-- Python実行: `& "C:\Users\nanko\AppData\Local\Python\bin\python.exe" <script>`
-- テスト実行: `& "C:\Users\nanko\AppData\Local\Python\bin\python.exe" -m unittest discover -s tests`
-- 非破壊コマンドのみを実行。
+- 実行コマンド: `py -3 -m unittest discover -s tests -p "test_*.py" -v`, `py -3 -m compileall cdripper tests main.py`
+- 非破壊コマンドのみ使用可能。

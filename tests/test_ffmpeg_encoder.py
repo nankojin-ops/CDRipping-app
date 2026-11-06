@@ -58,6 +58,19 @@ class TestFFmpegEncoder(unittest.TestCase):
         self.assertEqual(sanitize_filename("CONOUT$"), "_CONOUT$")
         self.assertEqual(sanitize_filename("CON"), "_CON")
 
+    def test_sanitize_filename_reserved_with_trailing_spaces_and_dots(self):
+        """SEC-008: 末尾スペースとピリオド混在時の予約名エスケープバイパス防止"""
+        self.assertEqual(sanitize_filename("CON ."), "_CON")
+        self.assertEqual(sanitize_filename("PRN. ."), "_PRN")
+        self.assertEqual(sanitize_filename("AUX   "), "_AUX")
+        self.assertEqual(sanitize_filename("NUL."), "_NUL")
+
+    def test_sanitize_filename_control_characters_replaced(self):
+        """SEC-009: 改行および ASCII 制御文字 (0x00-0x1F, 0x7F) がアンダースコアに置換されること"""
+        self.assertEqual(sanitize_filename("Track\nName\r01\t"), "Track_Name_01")
+        self.assertEqual(sanitize_filename("Bad\x00Track\x1fName"), "Bad_Track_Name")
+        self.assertEqual(sanitize_filename("Track\x7f"), "Track_")
+
     def test_build_ffmpeg_args_without_cover(self):
         """TC-ENC-01: アートワークなしAAC引数"""
         args = build_ffmpeg_args(

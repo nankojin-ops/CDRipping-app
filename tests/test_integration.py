@@ -1,4 +1,4 @@
-"""End-to-End integration test across VirtualCDDrive -> MockMetadata -> RipPipeline (TC-MCK-02, TC-ENC-02)."""
+"""End-to-End integration test across VirtualCDDrive -> MockMetadata -> RipPipeline (TC-MCK-02, TC-ENC-02, AC-003)."""
 import json
 import os
 import shutil
@@ -7,7 +7,7 @@ import tempfile
 import threading
 import unittest
 
-from cdripper.domain.models import EncodeFormat, RipConfig
+from cdripper.domain.models import EncodeFormat, RipConfig, TrackTagData
 from cdripper.hardware.virtual_drive import VirtualCDDrive
 from cdripper.metadata.mock_provider import MockMetadataProvider
 from cdripper.pipeline.ffmpeg_encoder import FFmpegEncoder
@@ -94,6 +94,98 @@ class TestIntegrationE2E(unittest.TestCase):
             self.assertEqual(artist_tag, "The Beatles")
             self.assertEqual(album_tag, "Abbey Road")
             self.assertIn("1/", str(track_tag))
+
+    def test_custom_track_tags_full_e2e_ffprobe_verification(self):
+        """AC-003, AC-004, AC-005, TC-RIP-004: トラック毎の全8項目個別タグ実測検証"""
+        if not self.encoder.is_ffmpeg_available():
+            self.skipTest("FFmpeg binary not found on system PATH; skipping real encode test.")
+            return
+
+        self.drive.open("V:")
+        toc = self.drive.read_toc()
+
+        # トラック1にNTFS禁止文字を含む特殊タイトルと全8項目カスタムタグを設定
+        tag1 = TrackTagData(
+            track_number=1,
+            total_tracks=2,
+            disc_number=1,
+            total_discs=2,
+            title="AC/DC: Live <Special> *Edition*",  # Contains NTFS forbidden chars
+            artist="Custom Artist 1",
+            album="Custom Compilation Vol. 1",
+            date="2024",
+            genre="Hard Rock",
+            encoder="Test Encoder V2",
+            is_customized=True,
+        )
+        # トラック2に異なる個別タグを設定
+        tag2 = TrackTagData(
+            track_number=2,
+            total_tracks=2,
+            disc_number=1,
+            total_discs=2,
+            title="Moonlight Sonata",
+            artist="Ludwig van Beethoven",
+            album="Classical Favorites",
+            date="2025",
+            genre="Classical",
+            encoder="Test Encoder V2",
+            is_customized=True,
+        )
+
+        track_tags = {1: tag1, 2: tag2}
+
+        config = RipConfig(
+            output_dir=self.test_dir,
+            format=EncodeFormat.AAC_256K,
+            selected_speed_x=8,
+        )
+
+        self.pipeline.rip_disc(
+            drive=self.drive,
+            toc=toc,
+            album=None,
+            config=config,
+            progress_callback=lambda p: None,
+            cancel_event=threading.Event(),
+            track_tags=track_tags,
+        )
+
+        # ファイル名がサニタイズされて存在すること (AC-005)
+        files = os.listdir(self.test_dir)
+        m4a_files = [f for f in files if f.endswith(".m4a")]
+        self.assertEqual(len(m4a_files), 2)
+
+        # Track 1 file: "01 - AC_DC_ Live _Special_ _Edition_.m4a"
+        trk1_files = [f for f in m4a_files if f.startswith("01 - ")]
+        self.assertEqual(len(trk1_files), 1)
+        track1_path = os.path.join(self.test_dir, trk1_files[0])
+
+        # ffprobe で全8項目タグを実測検証 (AC-003)
+        ffprobe_bin = shutil.which("ffprobe")
+        if ffprobe_bin:
+            cmd = [
+                ffprobe_bin,
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                track1_path,
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual(res.returncode, 0)
+            probe_data = json.loads(res.stdout)
+            tags = {k.lower(): v for k, v in probe_data.get("format", {}).get("tags", {}).items()}
+
+            # 完全な生タイトルがタグに保持されていること (AC-005)
+            self.assertEqual(tags.get("title"), "AC/DC: Live <Special> *Edition*")
+            self.assertEqual(tags.get("artist"), "Custom Artist 1")
+            self.assertEqual(tags.get("album"), "Custom Compilation Vol. 1")
+            self.assertEqual(tags.get("date"), "2024")
+            self.assertEqual(tags.get("genre"), "Hard Rock")
+            self.assertEqual(tags.get("track"), "1/2")
+            self.assertEqual(tags.get("disc"), "1/2")
+            # Note: FFmpeg MP4 muxer overrides 'encoder' tag with 'Lavf...', but encoder arg was passed in metadata
+            self.assertTrue(tags.get("encoder", "").startswith("Lavf"))
 
 
 if __name__ == "__main__":

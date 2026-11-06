@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 from cdripper.domain.exceptions import CDRipperError
 from cdripper.domain.models import (
@@ -12,6 +12,7 @@ from cdripper.domain.models import (
     DiscTOC,
     RipConfig,
     RipProgress,
+    TrackTagData,
     TrackTOC,
 )
 from cdripper.hardware.interface import ICDDrive
@@ -65,9 +66,11 @@ class AudioRipPipeline:
         progress_callback: Callable[[RipProgress], None],
         cancel_event: threading.Event,
         disc_number: int = 1,
+        track_tags: Optional[Dict[int, TrackTagData]] = None,
     ) -> None:
         """
         Rip all audio tracks in TOC, apply metadata, and encode to configured format.
+        When track_tags is provided, individual track metadata takes strict priority.
         """
         os.makedirs(config.output_dir, exist_ok=True)
 
@@ -79,6 +82,7 @@ class AudioRipPipeline:
 
         artwork_data = album.artwork_data if album else None
         total_tracks = len(toc.tracks)
+        seen_output_paths: set[str] = set()
 
         drive.set_read_speed(config.selected_speed_x)
 
@@ -101,16 +105,37 @@ class AudioRipPipeline:
                 continue
 
             track_num = track_toc.track_number
-            title = itunes_meta.track_title if itunes_meta else f"Track {track_num:02d}"
-            artist = itunes_meta.artist_name if itunes_meta else (album.artist_name if album else "Unknown Artist")
-            album_name = album.album_name if album else "Unknown Album"
-            year = album.release_year if album else ""
-            genre = album.genre if album else ""
+            custom_tag = track_tags.get(track_num) if track_tags else None
 
-            safe_title = sanitize_filename(title)
+            if custom_tag is not None:
+                fmt_track_num = custom_tag.track_number
+                title = custom_tag.title
+                safe_title = sanitize_filename(title)
+                metadata_dict = custom_tag.to_metadata_dict()
+            else:
+                fmt_track_num = track_num
+                title = itunes_meta.track_title if itunes_meta else f"Track {track_num:02d}"
+                artist = itunes_meta.artist_name if itunes_meta else (album.artist_name if album else "Unknown Artist")
+                album_name = album.album_name if album else "Unknown Album"
+                year = album.release_year if album else ""
+                genre = album.genre if album else ""
+                safe_title = sanitize_filename(title)
+
+                raw_dict = {
+                    "title": title,
+                    "artist": artist,
+                    "album": album_name,
+                    "track": f"{track_num}/{total_tracks}",
+                    "disc": f"{disc_number}/{album.total_discs if album else 1}",
+                    "date": year,
+                    "genre": genre,
+                    "encoder": "CD Ripping App (iTunes Compatible)",
+                }
+                metadata_dict = {k: v.strip() for k, v in raw_dict.items() if v and v.strip()}
+
             ext = config.format.extension
             filename = config.filename_template.format(
-                track_num=track_num,
+                track_num=fmt_track_num,
                 title=safe_title,
                 ext=ext,
             )
@@ -118,17 +143,15 @@ class AudioRipPipeline:
                 filename = f"{filename}{ext}"
 
             output_path = os.path.join(config.output_dir, filename)
-
-            metadata_dict = {
-                "title": title,
-                "artist": artist,
-                "album": album_name,
-                "track": f"{track_num}/{total_tracks}",
-                "disc": f"{disc_number}/{album.total_discs if album else 1}",
-                "date": year,
-                "genre": genre,
-                "encoder": "CD Ripping App (iTunes Compatible)",
-            }
+            if output_path in seen_output_paths:
+                base, fext = os.path.splitext(output_path)
+                collision_idx = 1
+                candidate = f"{base}_{collision_idx}{fext}"
+                while candidate in seen_output_paths:
+                    collision_idx += 1
+                    candidate = f"{base}_{collision_idx}{fext}"
+                output_path = candidate
+            seen_output_paths.add(output_path)
 
             session = self.encoder.start_encoding_session(
                 output_path=output_path,
@@ -164,6 +187,7 @@ class AudioRipPipeline:
                             overall_progress_percent=overall_pct,
                             current_speed_x=cur_speed,
                             status_text=f"Ripping Track {track_idx}/{total_tracks}: {title}",
+                            is_finished=False,
                         )
                     )
 
@@ -193,20 +217,9 @@ class AudioRipPipeline:
 
             except Exception as e:
                 session.cancel_and_cleanup(output_path)
-                progress_callback(
-                    RipProgress(
-                        current_track=track_idx,
-                        total_tracks=total_tracks,
-                        track_progress_percent=0.0,
-                        overall_progress_percent=float((track_idx - 1) / total_tracks * 100),
-                        current_speed_x=0.0,
-                        status_text=f"Error on track {track_idx}: {e}",
-                        is_finished=True,
-                        error_message=str(e),
-                    )
-                )
-                raise CDRipperError(f"Ripping failed on track {track_idx}: {e}")
+                raise CDRipperError(f"Failed while ripping track {track_idx}: {e}")
 
+        # All tracks finished successfully
         progress_callback(
             RipProgress(
                 current_track=total_tracks,
@@ -214,7 +227,7 @@ class AudioRipPipeline:
                 track_progress_percent=100.0,
                 overall_progress_percent=100.0,
                 current_speed_x=0.0,
-                status_text="Ripping completed successfully!",
+                status_text="Ripping completed successfully.",
                 is_finished=True,
             )
         )

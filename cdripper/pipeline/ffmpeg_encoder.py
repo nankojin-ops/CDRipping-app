@@ -16,21 +16,29 @@ from cdripper.domain.models import EncodeFormat, RipConfig
 def sanitize_filename(name: str, max_length: int = 120) -> str:
     """
     Sanitize filename for Windows NTFS file systems.
-    - Replaces invalid characters: \\ / : * ? " < > | with '_'
-    - Handles reserved device names including CONIN$ and CONOUT$ (FIND-012)
-    - Strips trailing dots and spaces
+    - Replaces invalid characters: ASCII control chars, \\ / : * ? " < > | with '_' (SEC-009)
+    - Strips trailing dots and spaces first to prevent bypass (SEC-008)
+    - Handles reserved device names including CONIN$ and CONOUT$ (FIND-012, SEC-006)
     - Limits string length to prevent MAX_PATH overflow
     """
     if not name:
         return "Unknown"
 
-    sanitized = re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+    # Strip leading/trailing whitespace first
+    sanitized = name.strip()
+
+    # Replace NTFS invalid characters including control characters (0x00-0x1f, 0x7f) (SEC-009)
+    sanitized = re.sub(r'[\x00-\x1f\x7f\\/*?:"<>|]', "_", sanitized)
+
+    # Strip trailing dots and spaces BEFORE matching reserved device names (SEC-008)
+    sanitized = re.sub(r"[.\s]+$", "", sanitized).strip()
 
     # FIND-012 (SEC-006): Add CONIN$ and CONOUT$ to reserved pattern
     reserved_pattern = r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$)(\..*)?$"
     if re.match(reserved_pattern, sanitized, re.IGNORECASE):
         sanitized = f"_{sanitized}"
 
+    # Re-strip trailing dots/spaces in case reserved prefix modification introduced any
     sanitized = re.sub(r"[.\s]+$", "", sanitized)
 
     if not sanitized:
